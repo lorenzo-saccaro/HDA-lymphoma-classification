@@ -4,14 +4,16 @@ import pandas as pd
 import numpy as np
 from matplotlib import pyplot as plt
 from sklearn.model_selection import StratifiedShuffleSplit
+from skimage.color import rgb2gray, rgb2lab, rgb2hed
 
 
 class LymphomaDataset:
 
-    def __init__(self, dataset_path, preprocess_fn_kwargs, dataset_kwargs, train_val_test_split,
-                 seed):
+    def __init__(self, dataset_path, data_augmentation, preprocess_fn_kwargs, dataset_kwargs,
+                 train_val_test_split, seed):
         """
         :param dataset_path: path to the dataset
+        :param data_augmentation: data augmentation, a tf.keras.Sequential model
         :param preprocess_fn_kwargs: arguments for the preprocessing function
         :param dataset_kwargs: arguments for the dataset caching and prefetching etc.
         :param train_val_test_split: list containing the split ratios for train, validation and test
@@ -24,12 +26,14 @@ class LymphomaDataset:
         assert np.allclose(np.sum(train_val_test_split), 1), "train_val_test_split must sum to 1"
         self.train_val_test_split = train_val_test_split
         self.seed = seed
+        self.data_augmentation = data_augmentation
+        self.num_patches_per_image = 0
 
-        train_split, val_split, test_split = self._split()
+        self.train_split, self.val_split, self.test_split = self._split()
 
-        self.train_dataset = self._create_dataset(train_split, 'train')
-        self.val_dataset = self._create_dataset(val_split, 'val')
-        self.test_dataset = self._create_dataset(test_split, 'test')
+        self.train_dataset = self._create_dataset(self.train_split, 'train')
+        self.val_dataset = self._create_dataset(self.val_split, 'val')
+        self.test_dataset = self._create_dataset(self.test_split, 'test')
 
     def _split(self):
         """
@@ -77,13 +81,20 @@ class LymphomaDataset:
         """
         # create dataset from pandas DataFrame containing file paths and labels
         dataset = tf.data.Dataset.from_tensor_slices((df['file_path'].values, df['label'].values))
-        # load images
-        load_func = lambda file_path, label: tf.numpy_function(self._load_image, [file_path, label],
-                                                               [tf.float32, tf.uint8])
-        dataset = dataset.map(load_func, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        # load and preprocess images
+        load_and_preprocess_func = lambda file_path, label: tf.numpy_function(
+            self._load_and_preprocess_image, [file_path, label], [tf.float32, tf.uint8])
+        dataset = dataset.map(load_and_preprocess_func,
+                              num_parallel_calls=self.dataset_kwargs['num_parallel_calls'])
 
-        # preprocess images, create patches and return them with their labels
-        dataset = dataset.map(self._preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        # create image patches
+        if self.dataset_kwargs['extract_patches']:
+            dataset = dataset.map(self._create_patches,
+                                  num_parallel_calls=self.dataset_kwargs['num_parallel_calls'])
+
+        # get shape of the first element in the dataset
+        shape = next(iter(dataset))[0].shape
+        self.num_patches_per_image = shape[0]
 
         # cache dataset, up to this point the transformations need to be applied only once
         if self.dataset_kwargs['cache_file'] is not None:
@@ -92,31 +103,40 @@ class LymphomaDataset:
             else:
                 dataset = dataset.cache(self.dataset_kwargs['cache_file'] + '_{}'.format(split))
 
-        # shuffle dataset if training
-        if split == 'train':
-            dataset = dataset.shuffle(buffer_size=self.dataset_kwargs['buffer_size'], seed=self.seed)
+        # apply data augmentation transformations if training (after caching)
+        if split == 'train' and self.data_augmentation is not None:
+            dataset = dataset.map(lambda x, y: (self.data_augmentation(x, training=True), y),
+                                  num_parallel_calls=self.dataset_kwargs['num_parallel_calls'])
+
+        # batch dataset, need to batch before reshaping patches
+        dataset = dataset.batch(1, num_parallel_calls=self.dataset_kwargs['num_parallel_calls'])
+
+        if self.dataset_kwargs['reshape_patches']:
+            # reshape patches
+            dataset = dataset.map(self._reshape_fn,
+                                  num_parallel_calls=self.dataset_kwargs['num_parallel_calls'])
+
+        # unbatch dataset, to select then how many patches to use in each batch
+        dataset = dataset.unbatch()
+
+        # shuffle dataset if training, patches from different images are mixed in this way
+        if split == 'train' and self.dataset_kwargs['shuffle']:
+            dataset = dataset.shuffle(buffer_size=self.dataset_kwargs['buffer_size'],
+                                      seed=self.seed)
 
         # repeat dataset indefinitely
         dataset = dataset.repeat()
 
-        # apply data augmentation transformations if training (after caching)
-        if split == 'train':
-            dataset = dataset.map(self._augment_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-
-        # batch dataset,
+        # batch dataset, number of patches per batch
         dataset = dataset.batch(self.dataset_kwargs['batch_size'],
-                                num_parallel_calls=tf.data.experimental.AUTOTUNE)
-
-        # reshape to 4D tensor with shape (batch_size*num_patches, patch_size, patch_size, channels)
-        dataset = dataset.map(self._reshape_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+                                num_parallel_calls=self.dataset_kwargs['num_parallel_calls'])
 
         # prefetch dataset
-        dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+        dataset = dataset.prefetch(buffer_size=1)
 
         return dataset
 
-    @staticmethod
-    def _load_image(file_path, label):
+    def _load_and_preprocess_image(self, file_path, label):
         """
         Loads an image from a file path
         :param file_path: path to the image
@@ -126,27 +146,34 @@ class LymphomaDataset:
         # read image
         image = tf.keras.utils.load_img(file_path)  # load image in rgb format
 
-        # convert to tensor
+        # convert to numpy array
         image = tf.keras.utils.img_to_array(image, dtype=np.float32)
+
+        # normalize image to [0, 1]
+        image = image / 255.0
+
+        # convert to desired color space
+        if self.preprocess_fn_kwargs['color_space'] == 'gray':
+            image = rgb2gray(image)[:, :, np.newaxis]  # add new axes to preserve correct shape
+        elif self.preprocess_fn_kwargs['color_space'] == 'lab':
+            image = rgb2lab(image)
+            # sRGB projected in Lab fit in an area of L=[0,100], a=[-87,99], b=[-108, 95]
+            image[:, :, 0] /= 100
+            image[:, :, 1] = (image[:, :, 1] + 87) / 186
+            image[:, :, 2] = (image[:, :, 2] + 108) / 203
+        elif self.preprocess_fn_kwargs['color_space'] == 'hed':
+            image = rgb2hed(image).astype('float32')
 
         return image, label
 
-    def _preprocess_fn(self, image, label):
+    def _create_patches(self, image, label):
         """
         Preprocesses the image
         :param image: image
         :param label: label of the image
-        :return: preprocessed image
+        :return: patches of image, label
         """
-
-        # here apply color space conversion if specified, before patch extraction and normalization
-        # TODO: add color space conversion
-
-        # normalize image
-        # TODO: check if different normalization is needed for different color spaces, standardize?
-        image = image / 255.
-
-        # extract patches
+        # expand image to 4D tensor with shape (1, height, width, channels)
         image = tf.expand_dims(image, axis=0)
         patches = tf.image.extract_patches(images=image,
                                            sizes=self.preprocess_fn_kwargs['patch_sizes'],
@@ -154,22 +181,11 @@ class LymphomaDataset:
                                            rates=self.preprocess_fn_kwargs['patch_rates'],
                                            padding=self.preprocess_fn_kwargs['patch_padding'])
 
-        # reshape patches
+        # reshape to 4D tensor with shape (num_patches, patch_size, patch_size, channels)
         patches = tf.reshape(patches, shape=[-1, self.preprocess_fn_kwargs['patch_sizes'][1],
                                              self.preprocess_fn_kwargs['patch_sizes'][2],
                                              tf.shape(image)[-1]])
 
-        return patches, label
-
-    def _augment_fn(self, patches, label):
-        """
-        Applies data augmentation transformations to the patches
-        :param patches: patches to be augmented
-        :param label: label of the patches
-        :return: augmented patches, labels
-        """
-
-        # TODO: add data augmentation transformations
         return patches, label
 
     @staticmethod
@@ -197,6 +213,17 @@ class LymphomaDataset:
         :return: train, validation and test datasets
         """
         return self.train_dataset, self.val_dataset, self.test_dataset
+
+    def get_steps(self):
+        """
+        Returns the number of steps per epoch for each dataset
+        :return: number of steps per epoch for each dataset
+        """
+        train_steps = len(self.train_split) * self.num_patches_per_image // self.dataset_kwargs['batch_size']
+        val_steps = len(self.val_split) * self.num_patches_per_image // self.dataset_kwargs['batch_size']
+        test_steps = len(self.test_split) * self.num_patches_per_image // self.dataset_kwargs['batch_size']
+
+        return train_steps, val_steps, test_steps
 
 
 if __name__ == '__main__':
@@ -232,8 +259,8 @@ if __name__ == '__main__':
         # plot some patches
         fig, axes = plt.subplots(3, 3)
         for i, ax in enumerate(axes.flat):
-            ax.imshow(patches[i*100, :, :, :])
-            ax.set_title('Label: {}'.format(labels[i*100].numpy()))
+            ax.imshow(patches[i * 100, :, :, :])
+            ax.set_title('Label: {}'.format(labels[i * 100].numpy()))
             ax.set_xticks([])
             ax.set_yticks([])
         plt.show()
